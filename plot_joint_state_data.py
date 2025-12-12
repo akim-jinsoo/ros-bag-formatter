@@ -31,12 +31,11 @@ Joint Selection (Alternative to --columns):
         --joint NAME            Select a specific joint by name (e.g., 'joint4').
                                 Requires --channel to specify the attribute (position, velocity, effort).
                                 Dynamically resolves the column index from the CSV data.
+                                In --batch and --compare modes, trials are automatically aligned by onset.
         --channel TYPE          Attribute to plot for the selected joint (position, velocity, effort).
                                 Default: position.
 
-Alignment & Clipping:
-        --align                 Align trials by onset of movement (derivative threshold).
-                                Requires exactly one column selected via --columns.
+Clipping:
         --clip START END        Clip to absolute time range [START, END] seconds.
         --peak BEFORE AFTER     Clip around the peak value. Requires exactly one column.
 
@@ -453,22 +452,20 @@ def process_batch_dir(batch_dir: Path, args):
         t, data = load_and_preprocess_trial(path, args, apply_clip=False)
         trials.append((t, data))
 
-    # Alignment
-    if args.align:
-        # Need exactly one channel to align on
-        align_channel = None
-        if args.columns and len(args.columns) == 1:
-            align_channel = args.columns[0]
-        elif trials and len(trials[0][1]) == 1:
-            align_channel = list(trials[0][1].keys())[0]
-        
-        if not align_channel:
-             raise SystemExit("--align requires exactly one column to be selected (via --columns).")
+    # Always align trials in batch mode
+    align_channel = None
+    if args.columns and len(args.columns) == 1:
+        align_channel = args.columns[0]
+    elif trials and len(trials[0][1]) == 1:
+        align_channel = list(trials[0][1].keys())[0]
+    
+    if not align_channel:
+         raise SystemExit("Batch and compare modes require exactly one column to be selected (via --columns or --joint).")
 
-        try:
-            trials = align_trials_by_derivative_peak(trials, channel=align_channel)
-        except ValueError as e:
-            print(f"Warning: Alignment failed: {e}")
+    try:
+        trials = align_trials_by_derivative_peak(trials, channel=align_channel)
+    except ValueError as e:
+        print(f"Warning: Alignment failed: {e}")
 
     # Clip after alignment
     if args.clip:
@@ -511,23 +508,33 @@ def compute_batch_stats(trials, channel):
     # Find common time range (union - full range)
     t_min = min(min(t) for t, _ in trials)
     t_max = max(max(t) for t, _ in trials)
-
+    
     t0, _ = trials[0]
     avg_dt = (t0[-1] - t0[0]) / (len(t0) - 1) if len(t0) > 1 else 0.001
     num_points = int((t_max - t_min) / avg_dt) + 1
     t_common = np.linspace(t_min, t_max, num_points)
 
+    # Interpolate each trial onto common time axis
+    # Use NaN for regions outside each trial's actual data range
     interpolated = []
     for t, data in trials:
         if channel not in data:
             raise ValueError(f"Channel {channel} missing.")
-        y_interp = np.interp(t_common, t, data[channel])
+        
+        # Create array filled with NaN
+        y_interp = np.full_like(t_common, np.nan, dtype=float)
+        
+        # Only interpolate within the trial's actual time range
+        trial_t_min = min(t)
+        trial_t_max = max(t)
+        mask = (t_common >= trial_t_min) & (t_common <= trial_t_max)
+        
+        y_interp[mask] = np.interp(t_common[mask], t, data[channel])
         interpolated.append(y_interp)
 
     stacked = np.array(interpolated)
-    return t_common, np.mean(stacked, axis=0), np.min(stacked, axis=0), np.max(stacked, axis=0)
-
-
+    # Use nanmean/nanmin/nanmax to ignore NaN values in statistics
+    return t_common, np.nanmean(stacked, axis=0), np.nanmin(stacked, axis=0), np.nanmax(stacked, axis=0)
 def plot_multi_batch_envelope(batch_data, channel, show_envelope=True, title=None):
     fig, ax = plt.subplots(figsize=(12, 6))
 
@@ -643,7 +650,6 @@ def main():
     )
     parser.add_argument("--clip", nargs=2, type=float, help="[All] Clip time range: START END")
     parser.add_argument("--peak", nargs=2, type=float, help="[Batch] Clip around peak: BEFORE AFTER")
-    parser.add_argument("--align", action="store_true", help="[Batch] Align trials by derivative onset")
     parser.add_argument("--flip", action="store_true", help="[All] Flip Y-axis values")
     parser.add_argument("--normalize", action="store_true", help="[All] Normalize to start at 0")
     parser.add_argument("--envelope", action="store_true", help="[Batch/Compare] Show min/max envelope")
@@ -701,14 +707,13 @@ def main():
             print("No data found for comparison.")
             return
 
-        # Only normalize time if using --align, otherwise plot raw data
-        if args.align:
-            global_min_t = min(item[1][0] for item in batch_data)
-            new_batch_data = []
-            for label, t, y_mean, y_min, y_max in batch_data:
-                t_shifted = t - global_min_t
-                new_batch_data.append((label, t_shifted, y_mean, y_min, y_max))
-            batch_data = new_batch_data
+        # Normalize time so the earliest point is at 0 (trials are already aligned)
+        global_min_t = min(item[1][0] for item in batch_data)
+        new_batch_data = []
+        for label, t, y_mean, y_min, y_max in batch_data:
+            t_shifted = t - global_min_t
+            new_batch_data.append((label, t_shifted, y_mean, y_min, y_max))
+        batch_data = new_batch_data
 
         # Use a generic label if target_channel varies or is obscure
         plot_label = target_channel
